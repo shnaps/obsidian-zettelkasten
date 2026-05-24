@@ -1,0 +1,11 @@
+{
+  "id": "zettelkasten-core",
+  "name": "Zettelkasten Core",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "A complete Zettelkasten second-brain system: fleeting notes, literature notes, permanent atomic notes, Zettel IDs, inbox processing, and linked thinking.",
+  "author": "wesswart77",
+  "authorUrl": "https://github.com/wesswart77",
+  "fundingUrl": "https://www.buymeacoffee.com/wesswart77",
+  "isDesktopOnly": false
+}
