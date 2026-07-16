@@ -14,11 +14,15 @@ import {
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
+type IdScheme = "timestamp" | "folgezettel";
+
 interface ZettelkastenSettings {
 	fleetingFolder: string;
 	literatureFolder: string;
 	permanentFolder: string;
+	idScheme: IdScheme;
 	idFormat: string;
+	rootIndexNote: string;
 	autoOpenNote: boolean;
 	inboxTag: string;
 }
@@ -27,10 +31,81 @@ const DEFAULT_SETTINGS: ZettelkastenSettings = {
 	fleetingFolder: "Zettelkasten/Fleeting",
 	literatureFolder: "Zettelkasten/Literature",
 	permanentFolder: "Zettelkasten/Permanent",
+	idScheme: "timestamp",
 	idFormat: "YYYYMMDDHHmm",
+	rootIndexNote: "",
 	autoOpenNote: true,
 	inboxTag: "inbox",
 };
+
+// ─── Folgezettel ID Algebra ─────────────────────────────────────────────────
+//
+// Luhmann-style branching IDs alternate number / letter segments:
+//   1 → child 1a → child 1a1 → child 1a1a …
+//   sibling of 1a is 1b; sibling of 1 is 2.
+// A note's children deepen the ID; its siblings increment the last segment.
+
+// A folgezettel ID: short leading number, then alternating letter/number runs.
+// Leading number capped at 4 digits so 12-digit timestamps never match.
+const FOLGEZETTEL_RE = /^\d{1,4}(?:[a-z]+\d+)*[a-z]*$/i;
+
+function isFolgezettelId(id: string): boolean {
+	return FOLGEZETTEL_RE.test(id);
+}
+
+// The leading ID token of a note filename, or null. "1a2 Title" → "1a2".
+function leadingId(basename: string): string | null {
+	const m = basename.match(/^(\S+)/);
+	return m ? m[1] : null;
+}
+
+// Split "1a2b" into ["1","a","2","b"].
+function splitFolgezettel(id: string): string[] {
+	return id.match(/\d+|[a-zA-Z]+/g) ?? [];
+}
+
+// Bijective base-26 letter increment: a→b, z→aa, az→ba.
+function incrementLetters(s: string): string {
+	const out = s.toLowerCase().split("");
+	let i = out.length - 1;
+	while (i >= 0) {
+		if (out[i] === "z") {
+			out[i] = "a";
+			i--;
+		} else {
+			out[i] = String.fromCharCode(out[i].charCodeAt(0) + 1);
+			return out.join("");
+		}
+	}
+	return "a" + out.join("");
+}
+
+// Increment a single segment in place (digit → +1, letters → base-26).
+function incrementSegment(seg: string): string {
+	return /\d/.test(seg) ? String(parseInt(seg, 10) + 1) : incrementLetters(seg);
+}
+
+// Increment the last segment of an ID (the "next sibling" operation).
+function bumpLastSegment(id: string): string {
+	const tokens = splitFolgezettel(id);
+	if (tokens.length === 0) return id;
+	tokens[tokens.length - 1] = incrementSegment(tokens[tokens.length - 1]);
+	return tokens.join("");
+}
+
+// First child of an ID: append "a" after a number, "1" after letters.
+function firstChildId(parent: string): string {
+	const tokens = splitFolgezettel(parent);
+	const last = tokens[tokens.length - 1] ?? "";
+	return parent + (/\d/.test(last) ? "a" : "1");
+}
+
+// Parent ID: drop the last segment. "1a2" → "1a", "1" → null (root has no parent).
+function parentFolgezettelId(id: string): string | null {
+	const tokens = splitFolgezettel(id);
+	if (tokens.length <= 1) return null;
+	return tokens.slice(0, -1).join("");
+}
 
 // ─── Inbox View ───────────────────────────────────────────────────────────────
 
@@ -274,6 +349,99 @@ class PermanentNoteModal extends Modal {
 	}
 }
 
+type FolgezettelMode = "root" | "child" | "sibling";
+
+class FolgezettelNoteModal extends Modal {
+	plugin: ZettelkastenPlugin;
+	refId: string | null;
+	defaultMode: FolgezettelMode;
+	onSubmit: (title: string, content: string, mode: FolgezettelMode) => void;
+
+	constructor(
+		app: App,
+		plugin: ZettelkastenPlugin,
+		refId: string | null,
+		defaultMode: FolgezettelMode,
+		onSubmit: (title: string, content: string, mode: FolgezettelMode) => void
+	) {
+		super(app);
+		this.plugin = plugin;
+		this.refId = refId;
+		this.defaultMode = defaultMode;
+		this.onSubmit = onSubmit;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.addClass("zk-modal");
+		contentEl.createEl("h2", { text: "New Folgezettel Note" });
+		contentEl.createEl("p", {
+			text: "Branches land as fleeting notes — refine and promote them later. A child deepens the thread, a sibling continues it.",
+			cls: "zk-modal-hint",
+		});
+
+		let title = "";
+		let content = "";
+		// Top-level notes are their own sibling sequence — for a root, "sibling"
+		// and "root" coincide, so we drop sibling and fold it into root.
+		const refIsRoot = this.refId !== null && /^\d+$/.test(this.refId);
+		let mode: FolgezettelMode = this.refId ? this.defaultMode : "root";
+		if (refIsRoot && mode === "sibling") mode = "root";
+
+		new Setting(contentEl).setName("Title").addText((t) => {
+			t.setPlaceholder("The idea in a phrase").onChange((v) => (title = v));
+			t.inputEl.focus();
+		});
+
+		new Setting(contentEl).setName("Note").addTextArea((a) => {
+			a.setPlaceholder("Expand the thought...").onChange((v) => (content = v));
+			a.inputEl.rows = 5;
+			a.inputEl.addClass("zk-textarea");
+		});
+
+		const preview = contentEl.createEl("p", { cls: "zk-modal-hint" });
+		const updatePreview = () => {
+			preview.setText(`Next ID: ${this.plugin.computeFolgezettelId(mode, this.refId)}`);
+		};
+
+		new Setting(contentEl)
+			.setName("Position")
+			.setDesc(this.refId ? `Relative to ${this.refId}` : "No folgezettel note active — creates a new root thread.")
+			.addDropdown((d) => {
+				if (this.refId) {
+					d.addOption("child", "Child (deepen)");
+					if (!refIsRoot) d.addOption("sibling", "Sibling (continue)");
+				}
+				d.addOption("root", "Root (new thread)");
+				d.setValue(mode);
+				d.onChange((v) => {
+					mode = v as FolgezettelMode;
+					updatePreview();
+				});
+			});
+
+		updatePreview();
+
+		new Setting(contentEl).addButton((btn) =>
+			btn
+				.setButtonText("Create Folgezettel Note")
+				.setCta()
+				.onClick(() => {
+					if (!title.trim()) {
+						new Notice("Title is required.");
+						return;
+					}
+					this.onSubmit(title.trim(), content.trim(), mode);
+					this.close();
+				})
+		);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface LiteratureNoteData {
@@ -321,10 +489,32 @@ export default class ZettelkastenPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "new-folgezettel-note",
+			name: "New folgezettel note",
+			callback: () => this.openFolgezettelNoteModal(),
+		});
+
+		this.addCommand({
+			id: "new-folgezettel-child",
+			name: "New folgezettel child of current note",
+			callback: () => this.quickFolgezettel("child"),
+		});
+
+		this.addCommand({
+			id: "new-folgezettel-sibling",
+			name: "New folgezettel sibling of current note",
+			callback: () => this.quickFolgezettel("sibling"),
+		});
+
+		this.addCommand({
 			id: "open-inbox",
 			name: "Open inbox",
 			callback: () => this.openInboxView(),
 		});
+
+		this.addRibbonIcon("git-branch", "New folgezettel note (branch from current)", () =>
+			this.openFolgezettelNoteModal()
+		);
 
 		this.addRibbonIcon("inbox", "Zettelkasten Inbox", () => this.openInboxView());
 
@@ -355,8 +545,93 @@ export default class ZettelkastenPlugin extends Plugin {
 		}).open();
 	}
 
+	openFolgezettelNoteModal() {
+		const refId = this.activeFolgezettelId();
+		new FolgezettelNoteModal(this.app, this, refId, refId ? "child" : "root", async (title, content, mode) => {
+			await this.createFolgezettelNote(title, content, mode, refId);
+		}).open();
+	}
+
+	// Command shortcut: open the modal preset to branch from the active note.
+	quickFolgezettel(mode: FolgezettelMode) {
+		const refId = this.activeFolgezettelId();
+		if (!refId) {
+			new Notice("Active note has no folgezettel ID. Open a folgezettel note first.");
+			return;
+		}
+		new FolgezettelNoteModal(this.app, this, refId, mode, async (title, content, chosenMode) => {
+			await this.createFolgezettelNote(title, content, chosenMode, refId);
+		}).open();
+	}
+
+	// Scheme-aware ID for the standard "new note" flows (root when folgezettel).
 	zettelId(): string {
+		if (this.settings.idScheme === "folgezettel") {
+			return this.computeFolgezettelId("root", null);
+		}
 		return moment().format(this.settings.idFormat);
+	}
+
+	// ─── Folgezettel ────────────────────────────────────────────────────────
+
+	// Every folgezettel-shaped ID across all note folders (IDs are vault-global
+	// because a note keeps its ID as it moves fleeting → literature → permanent).
+	folgezettelIds(): string[] {
+		const prefixes = [
+			this.settings.fleetingFolder,
+			this.settings.literatureFolder,
+			this.settings.permanentFolder,
+		].map((p) => p + "/");
+		return this.app.vault
+			.getMarkdownFiles()
+			.filter((f) => prefixes.some((p) => f.path.startsWith(p)))
+			.map((f) => leadingId(f.basename))
+			.filter((id): id is string => id !== null && isFolgezettelId(id));
+	}
+
+	// Locate the file for a given folgezettel ID (exact ID or "ID Title.md").
+	folgezettelFileById(id: string): TFile | null {
+		return (
+			this.app.vault.getMarkdownFiles().find((f) => f.basename === id || f.basename.startsWith(id + " ")) ?? null
+		);
+	}
+
+	// The folgezettel ID of the currently active note, or null.
+	activeFolgezettelId(): string | null {
+		const file = this.app.workspace.getActiveFile();
+		if (!file) return null;
+		const id = leadingId(file.basename);
+		return id && isFolgezettelId(id) ? id : null;
+	}
+
+	// Compute the next free ID for a mode, avoiding collisions with existing notes.
+	computeFolgezettelId(mode: FolgezettelMode, refId: string | null): string {
+		const ids = new Set(this.folgezettelIds());
+
+		if (mode === "root" || !refId) {
+			const roots = [...ids]
+				.map((id) => splitFolgezettel(id)[0])
+				.filter((t) => /^\d+$/.test(t))
+				.map((t) => parseInt(t, 10));
+			const next = roots.length ? Math.max(...roots) + 1 : 1;
+			return String(next);
+		}
+
+		let candidate = mode === "child" ? firstChildId(refId) : bumpLastSegment(refId);
+		while (ids.has(candidate)) candidate = bumpLastSegment(candidate);
+		return candidate;
+	}
+
+	// Branch: create a fleeting note carrying the computed folgezettel ID.
+	// Luhmann flow — new branches start fleeting, get promoted later.
+	async createFolgezettelNote(
+		title: string,
+		content: string,
+		mode: FolgezettelMode,
+		refId: string | null
+	): Promise<TFile> {
+		const id = this.computeFolgezettelId(mode, refId);
+		return this.createFleetingNote(title, content, id);
 	}
 
 	async ensureFolder(path: string) {
@@ -365,15 +640,28 @@ export default class ZettelkastenPlugin extends Plugin {
 		}
 	}
 
-	async createFleetingNote(title: string, content: string): Promise<TFile> {
+	// Frontmatter "parent:" line for a folgezettel ID, or "" when none applies.
+	parentFrontmatter(id: string): string {
+		if (this.settings.idScheme !== "folgezettel" || !isFolgezettelId(id)) return "";
+		const parentId = parentFolgezettelId(id);
+		if (parentId) {
+			const parentFile = this.folgezettelFileById(parentId);
+			return `parent: "[[${parentFile ? parentFile.basename : parentId}]]"\n`;
+		}
+		// Root note: optionally anchor it to a shared index / MOC so it isn't orphaned.
+		const idx = this.settings.rootIndexNote.trim().replace(/\.md$/, "");
+		return idx ? `parent: "[[${idx}]]"\n` : "";
+	}
+
+	async createFleetingNote(title: string, content: string, id?: string): Promise<TFile> {
 		await this.ensureFolder(this.settings.fleetingFolder);
-		const id = this.zettelId();
+		id = id ?? this.zettelId();
 		const filename = `${this.settings.fleetingFolder}/${id} ${title}.md`;
 		const body = `---
 id: ${id}
 title: "${title}"
 type: fleeting
-created: ${moment().format("YYYY-MM-DD HH:mm")}
+${this.parentFrontmatter(id)}created: ${moment().format("YYYY-MM-DD HH:mm")}
 tags:
   - ${this.settings.inboxTag}
 ---
@@ -386,9 +674,9 @@ ${content}
 		return file;
 	}
 
-	async createLiteratureNote(data: LiteratureNoteData): Promise<TFile> {
+	async createLiteratureNote(data: LiteratureNoteData, id?: string): Promise<TFile> {
 		await this.ensureFolder(this.settings.literatureFolder);
-		const id = this.zettelId();
+		id = id ?? this.zettelId();
 		const filename = `${this.settings.literatureFolder}/${id} ${data.title}.md`;
 		const quotesSection = data.quotes.trim()
 			? `\n## Quotes\n\n${data.quotes
@@ -401,7 +689,7 @@ ${content}
 id: ${id}
 title: "${data.title}"
 type: literature
-author: "${data.author}"
+${this.parentFrontmatter(id)}author: "${data.author}"
 source: "${data.source}"
 year: "${data.year}"
 created: ${moment().format("YYYY-MM-DD HH:mm")}
@@ -424,9 +712,9 @@ _What does this mean for my thinking?_
 		return file;
 	}
 
-	async createPermanentNote(data: PermanentNoteData): Promise<TFile> {
+	async createPermanentNote(data: PermanentNoteData, id?: string): Promise<TFile> {
 		await this.ensureFolder(this.settings.permanentFolder);
-		const id = this.zettelId();
+		id = id ?? this.zettelId();
 		const filename = `${this.settings.permanentFolder}/${id} ${data.title}.md`;
 		const tags = data.tags
 			.split(",")
@@ -438,7 +726,7 @@ _What does this mean for my thinking?_
 id: ${id}
 title: "${data.title}"
 type: permanent
-created: ${moment().format("YYYY-MM-DD HH:mm")}
+${this.parentFrontmatter(id)}created: ${moment().format("YYYY-MM-DD HH:mm")}
 tags:
 ${tags || "  - permanent"}
 ---
@@ -463,10 +751,25 @@ _What does this change or open up?_
 
 	// ─── Promotion ──────────────────────────────────────────────────────────
 
+	// Split "1a My idea" → { id: "1a", title: "My idea" }. Falls back to the
+	// whole basename as title when there's no leading ID token.
+	splitBasename(basename: string): { id: string | null; title: string } {
+		const m = basename.match(/^(\S+)\s+(.+)$/);
+		if (m) return { id: m[1], title: m[2] };
+		return { id: null, title: basename };
+	}
+
+	// Keep the note's folgezettel ID as it graduates fleeting → permanent/literature.
+	promotedId(basename: string): string | undefined {
+		if (this.settings.idScheme !== "folgezettel") return undefined;
+		const { id } = this.splitBasename(basename);
+		return id && isFolgezettelId(id) ? id : undefined;
+	}
+
 	async promoteFleetingToPermanent(file: TFile) {
 		const content = await this.app.vault.read(file);
-		const titleMatch = file.basename.match(/^\d+ (.+)$/);
-		const title = titleMatch ? titleMatch[1] : file.basename;
+		const { title } = this.splitBasename(file.basename);
+		const keepId = this.promotedId(file.basename);
 
 		const bodyLines = content.split("\n");
 		const bodyStart = bodyLines.findIndex((l, i) => i > 0 && l === "---") + 1;
@@ -476,16 +779,17 @@ _What does this change or open up?_
 			title,
 			idea: noteBody,
 			tags: "permanent",
-			links: `[[${file.basename}]]`,
+			links: "",
 		};
 
-		await this.createPermanentNote(data);
+		await this.createPermanentNote(data, keepId);
+		await this.app.fileManager.trashFile(file);
 		new Notice(`Promoted "${title}" to permanent note.`);
 	}
 
 	async promoteFleetingToLiterature(file: TFile) {
-		const titleMatch = file.basename.match(/^\d+ (.+)$/);
-		const title = titleMatch ? titleMatch[1] : file.basename;
+		const { title } = this.splitBasename(file.basename);
+		const keepId = this.promotedId(file.basename);
 		const content = await this.app.vault.read(file);
 		const bodyLines = content.split("\n");
 		const bodyStart = bodyLines.findIndex((l, i) => i > 0 && l === "---") + 1;
@@ -500,7 +804,8 @@ _What does this change or open up?_
 			quotes: "",
 		};
 
-		await this.createLiteratureNote(data);
+		await this.createLiteratureNote(data, keepId);
+		await this.app.fileManager.trashFile(file);
 		new Notice(`Promoted "${title}" to literature note.`);
 	}
 
@@ -586,17 +891,53 @@ class ZettelkastenSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Zettel ID format")
-			.setDesc("Moment.js format for auto-generated IDs. Default: YYYYMMDDHHmm")
-			.addText((t) =>
-				t
-					.setPlaceholder("YYYYMMDDHHmm")
-					.setValue(this.plugin.settings.idFormat)
+			.setName("ID scheme")
+			.setDesc(
+				"Timestamp: date-time IDs (YYYYMMDDHHmm). Folgezettel: Luhmann branching IDs (1, 1a, 1a1…) shared across all note types. Child/sibling commands branch the active note into a fleeting note."
+			)
+			.addDropdown((d) =>
+				d
+					.addOption("timestamp", "Timestamp")
+					.addOption("folgezettel", "Folgezettel (branching)")
+					.setValue(this.plugin.settings.idScheme)
 					.onChange(async (v) => {
-						this.plugin.settings.idFormat = v;
+						this.plugin.settings.idScheme = v as IdScheme;
 						await this.plugin.saveSettings();
+						this.display();
 					})
 			);
+
+		if (this.plugin.settings.idScheme === "timestamp") {
+			new Setting(containerEl)
+				.setName("Zettel ID format")
+				.setDesc("Moment.js format for timestamp IDs. Default: YYYYMMDDHHmm")
+				.addText((t) =>
+					t
+						.setPlaceholder("YYYYMMDDHHmm")
+						.setValue(this.plugin.settings.idFormat)
+						.onChange(async (v) => {
+							this.plugin.settings.idFormat = v;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
+
+		if (this.plugin.settings.idScheme === "folgezettel") {
+			new Setting(containerEl)
+				.setName("Root index note")
+				.setDesc(
+					"Optional. New root notes (1, 2, 3…) get a parent link to this note so they aren't orphaned in the graph. Note name or path, e.g. Index or Zettelkasten/Index. Leave empty to disable."
+				)
+				.addText((t) =>
+					t
+						.setPlaceholder("Index")
+						.setValue(this.plugin.settings.rootIndexNote)
+						.onChange(async (v) => {
+							this.plugin.settings.rootIndexNote = v;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
 
 		new Setting(containerEl)
 			.setName("Auto-open new notes")

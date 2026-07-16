@@ -1,6 +1,6 @@
 {
   "name": "obsidian-zettelkasten",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Zettelkasten Core plugin for Obsidian",
   "main": "main.js",
   "scripts": {

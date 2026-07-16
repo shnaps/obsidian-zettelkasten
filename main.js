@@ -27,10 +27,60 @@ var DEFAULT_SETTINGS = {
   fleetingFolder: "Zettelkasten/Fleeting",
   literatureFolder: "Zettelkasten/Literature",
   permanentFolder: "Zettelkasten/Permanent",
+  idScheme: "timestamp",
   idFormat: "YYYYMMDDHHmm",
+  rootIndexNote: "",
   autoOpenNote: true,
   inboxTag: "inbox"
 };
+var FOLGEZETTEL_RE = /^\d{1,4}(?:[a-z]+\d+)*[a-z]*$/i;
+function isFolgezettelId(id) {
+  return FOLGEZETTEL_RE.test(id);
+}
+function leadingId(basename) {
+  const m = basename.match(/^(\S+)/);
+  return m ? m[1] : null;
+}
+function splitFolgezettel(id) {
+  var _a;
+  return (_a = id.match(/\d+|[a-zA-Z]+/g)) != null ? _a : [];
+}
+function incrementLetters(s) {
+  const out = s.toLowerCase().split("");
+  let i = out.length - 1;
+  while (i >= 0) {
+    if (out[i] === "z") {
+      out[i] = "a";
+      i--;
+    } else {
+      out[i] = String.fromCharCode(out[i].charCodeAt(0) + 1);
+      return out.join("");
+    }
+  }
+  return "a" + out.join("");
+}
+function incrementSegment(seg) {
+  return /\d/.test(seg) ? String(parseInt(seg, 10) + 1) : incrementLetters(seg);
+}
+function bumpLastSegment(id) {
+  const tokens = splitFolgezettel(id);
+  if (tokens.length === 0)
+    return id;
+  tokens[tokens.length - 1] = incrementSegment(tokens[tokens.length - 1]);
+  return tokens.join("");
+}
+function firstChildId(parent) {
+  var _a;
+  const tokens = splitFolgezettel(parent);
+  const last = (_a = tokens[tokens.length - 1]) != null ? _a : "";
+  return parent + (/\d/.test(last) ? "a" : "1");
+}
+function parentFolgezettelId(id) {
+  const tokens = splitFolgezettel(id);
+  if (tokens.length <= 1)
+    return null;
+  return tokens.slice(0, -1).join("");
+}
 var INBOX_VIEW_TYPE = "zettelkasten-inbox";
 var InboxView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
@@ -213,6 +263,70 @@ var PermanentNoteModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
+var FolgezettelNoteModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, refId, defaultMode, onSubmit) {
+    super(app);
+    this.plugin = plugin;
+    this.refId = refId;
+    this.defaultMode = defaultMode;
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("zk-modal");
+    contentEl.createEl("h2", { text: "New Folgezettel Note" });
+    contentEl.createEl("p", {
+      text: "Branches land as fleeting notes \u2014 refine and promote them later. A child deepens the thread, a sibling continues it.",
+      cls: "zk-modal-hint"
+    });
+    let title = "";
+    let content = "";
+    const refIsRoot = this.refId !== null && /^\d+$/.test(this.refId);
+    let mode = this.refId ? this.defaultMode : "root";
+    if (refIsRoot && mode === "sibling")
+      mode = "root";
+    new import_obsidian.Setting(contentEl).setName("Title").addText((t) => {
+      t.setPlaceholder("The idea in a phrase").onChange((v) => title = v);
+      t.inputEl.focus();
+    });
+    new import_obsidian.Setting(contentEl).setName("Note").addTextArea((a) => {
+      a.setPlaceholder("Expand the thought...").onChange((v) => content = v);
+      a.inputEl.rows = 5;
+      a.inputEl.addClass("zk-textarea");
+    });
+    const preview = contentEl.createEl("p", { cls: "zk-modal-hint" });
+    const updatePreview = () => {
+      preview.setText(`Next ID: ${this.plugin.computeFolgezettelId(mode, this.refId)}`);
+    };
+    new import_obsidian.Setting(contentEl).setName("Position").setDesc(this.refId ? `Relative to ${this.refId}` : "No folgezettel note active \u2014 creates a new root thread.").addDropdown((d) => {
+      if (this.refId) {
+        d.addOption("child", "Child (deepen)");
+        if (!refIsRoot)
+          d.addOption("sibling", "Sibling (continue)");
+      }
+      d.addOption("root", "Root (new thread)");
+      d.setValue(mode);
+      d.onChange((v) => {
+        mode = v;
+        updatePreview();
+      });
+    });
+    updatePreview();
+    new import_obsidian.Setting(contentEl).addButton(
+      (btn) => btn.setButtonText("Create Folgezettel Note").setCta().onClick(() => {
+        if (!title.trim()) {
+          new import_obsidian.Notice("Title is required.");
+          return;
+        }
+        this.onSubmit(title.trim(), content.trim(), mode);
+        this.close();
+      })
+    );
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 var ZettelkastenPlugin = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
@@ -233,10 +347,30 @@ var ZettelkastenPlugin = class extends import_obsidian.Plugin {
       callback: () => this.openPermanentNoteModal()
     });
     this.addCommand({
+      id: "new-folgezettel-note",
+      name: "New folgezettel note",
+      callback: () => this.openFolgezettelNoteModal()
+    });
+    this.addCommand({
+      id: "new-folgezettel-child",
+      name: "New folgezettel child of current note",
+      callback: () => this.quickFolgezettel("child")
+    });
+    this.addCommand({
+      id: "new-folgezettel-sibling",
+      name: "New folgezettel sibling of current note",
+      callback: () => this.quickFolgezettel("sibling")
+    });
+    this.addCommand({
       id: "open-inbox",
       name: "Open inbox",
       callback: () => this.openInboxView()
     });
+    this.addRibbonIcon(
+      "git-branch",
+      "New folgezettel note (branch from current)",
+      () => this.openFolgezettelNoteModal()
+    );
     this.addRibbonIcon("inbox", "Zettelkasten Inbox", () => this.openInboxView());
     this.addSettingTab(new ZettelkastenSettingTab(this.app, this));
   }
@@ -259,23 +393,101 @@ var ZettelkastenPlugin = class extends import_obsidian.Plugin {
       await this.createPermanentNote(data);
     }).open();
   }
+  openFolgezettelNoteModal() {
+    const refId = this.activeFolgezettelId();
+    new FolgezettelNoteModal(this.app, this, refId, refId ? "child" : "root", async (title, content, mode) => {
+      await this.createFolgezettelNote(title, content, mode, refId);
+    }).open();
+  }
+  // Command shortcut: open the modal preset to branch from the active note.
+  quickFolgezettel(mode) {
+    const refId = this.activeFolgezettelId();
+    if (!refId) {
+      new import_obsidian.Notice("Active note has no folgezettel ID. Open a folgezettel note first.");
+      return;
+    }
+    new FolgezettelNoteModal(this.app, this, refId, mode, async (title, content, chosenMode) => {
+      await this.createFolgezettelNote(title, content, chosenMode, refId);
+    }).open();
+  }
+  // Scheme-aware ID for the standard "new note" flows (root when folgezettel).
   zettelId() {
+    if (this.settings.idScheme === "folgezettel") {
+      return this.computeFolgezettelId("root", null);
+    }
     return (0, import_obsidian.moment)().format(this.settings.idFormat);
+  }
+  // ─── Folgezettel ────────────────────────────────────────────────────────
+  // Every folgezettel-shaped ID across all note folders (IDs are vault-global
+  // because a note keeps its ID as it moves fleeting → literature → permanent).
+  folgezettelIds() {
+    const prefixes = [
+      this.settings.fleetingFolder,
+      this.settings.literatureFolder,
+      this.settings.permanentFolder
+    ].map((p) => p + "/");
+    return this.app.vault.getMarkdownFiles().filter((f) => prefixes.some((p) => f.path.startsWith(p))).map((f) => leadingId(f.basename)).filter((id) => id !== null && isFolgezettelId(id));
+  }
+  // Locate the file for a given folgezettel ID (exact ID or "ID Title.md").
+  folgezettelFileById(id) {
+    var _a;
+    return (_a = this.app.vault.getMarkdownFiles().find((f) => f.basename === id || f.basename.startsWith(id + " "))) != null ? _a : null;
+  }
+  // The folgezettel ID of the currently active note, or null.
+  activeFolgezettelId() {
+    const file = this.app.workspace.getActiveFile();
+    if (!file)
+      return null;
+    const id = leadingId(file.basename);
+    return id && isFolgezettelId(id) ? id : null;
+  }
+  // Compute the next free ID for a mode, avoiding collisions with existing notes.
+  computeFolgezettelId(mode, refId) {
+    const ids = new Set(this.folgezettelIds());
+    if (mode === "root" || !refId) {
+      const roots = [...ids].map((id) => splitFolgezettel(id)[0]).filter((t) => /^\d+$/.test(t)).map((t) => parseInt(t, 10));
+      const next = roots.length ? Math.max(...roots) + 1 : 1;
+      return String(next);
+    }
+    let candidate = mode === "child" ? firstChildId(refId) : bumpLastSegment(refId);
+    while (ids.has(candidate))
+      candidate = bumpLastSegment(candidate);
+    return candidate;
+  }
+  // Branch: create a fleeting note carrying the computed folgezettel ID.
+  // Luhmann flow — new branches start fleeting, get promoted later.
+  async createFolgezettelNote(title, content, mode, refId) {
+    const id = this.computeFolgezettelId(mode, refId);
+    return this.createFleetingNote(title, content, id);
   }
   async ensureFolder(path) {
     if (!await this.app.vault.adapter.exists(path)) {
       await this.app.vault.createFolder(path);
     }
   }
-  async createFleetingNote(title, content) {
+  // Frontmatter "parent:" line for a folgezettel ID, or "" when none applies.
+  parentFrontmatter(id) {
+    if (this.settings.idScheme !== "folgezettel" || !isFolgezettelId(id))
+      return "";
+    const parentId = parentFolgezettelId(id);
+    if (parentId) {
+      const parentFile = this.folgezettelFileById(parentId);
+      return `parent: "[[${parentFile ? parentFile.basename : parentId}]]"
+`;
+    }
+    const idx = this.settings.rootIndexNote.trim().replace(/\.md$/, "");
+    return idx ? `parent: "[[${idx}]]"
+` : "";
+  }
+  async createFleetingNote(title, content, id) {
     await this.ensureFolder(this.settings.fleetingFolder);
-    const id = this.zettelId();
+    id = id != null ? id : this.zettelId();
     const filename = `${this.settings.fleetingFolder}/${id} ${title}.md`;
     const body = `---
 id: ${id}
 title: "${title}"
 type: fleeting
-created: ${(0, import_obsidian.moment)().format("YYYY-MM-DD HH:mm")}
+${this.parentFrontmatter(id)}created: ${(0, import_obsidian.moment)().format("YYYY-MM-DD HH:mm")}
 tags:
   - ${this.settings.inboxTag}
 ---
@@ -288,9 +500,9 @@ ${content}
     new import_obsidian.Notice(`Fleeting note created: ${title}`);
     return file;
   }
-  async createLiteratureNote(data) {
+  async createLiteratureNote(data, id) {
     await this.ensureFolder(this.settings.literatureFolder);
-    const id = this.zettelId();
+    id = id != null ? id : this.zettelId();
     const filename = `${this.settings.literatureFolder}/${id} ${data.title}.md`;
     const quotesSection = data.quotes.trim() ? `
 ## Quotes
@@ -301,7 +513,7 @@ ${data.quotes.split("\n").filter((l) => l.trim()).map((l) => `> ${l}`).join("\n\
 id: ${id}
 title: "${data.title}"
 type: literature
-author: "${data.author}"
+${this.parentFrontmatter(id)}author: "${data.author}"
 source: "${data.source}"
 year: "${data.year}"
 created: ${(0, import_obsidian.moment)().format("YYYY-MM-DD HH:mm")}
@@ -324,9 +536,9 @@ _What does this mean for my thinking?_
     new import_obsidian.Notice(`Literature note created: ${data.title}`);
     return file;
   }
-  async createPermanentNote(data) {
+  async createPermanentNote(data, id) {
     await this.ensureFolder(this.settings.permanentFolder);
-    const id = this.zettelId();
+    id = id != null ? id : this.zettelId();
     const filename = `${this.settings.permanentFolder}/${id} ${data.title}.md`;
     const tags = data.tags.split(",").map((t) => `  - ${t.trim()}`).filter((t) => t.trim() !== "  -").join("\n");
     const links = data.links.trim() ? `
@@ -338,7 +550,7 @@ ${data.links}
 id: ${id}
 title: "${data.title}"
 type: permanent
-created: ${(0, import_obsidian.moment)().format("YYYY-MM-DD HH:mm")}
+${this.parentFrontmatter(id)}created: ${(0, import_obsidian.moment)().format("YYYY-MM-DD HH:mm")}
 tags:
 ${tags || "  - permanent"}
 ---
@@ -362,10 +574,25 @@ _What does this change or open up?_
     return file;
   }
   // ─── Promotion ──────────────────────────────────────────────────────────
+  // Split "1a My idea" → { id: "1a", title: "My idea" }. Falls back to the
+  // whole basename as title when there's no leading ID token.
+  splitBasename(basename) {
+    const m = basename.match(/^(\S+)\s+(.+)$/);
+    if (m)
+      return { id: m[1], title: m[2] };
+    return { id: null, title: basename };
+  }
+  // Keep the note's folgezettel ID as it graduates fleeting → permanent/literature.
+  promotedId(basename) {
+    if (this.settings.idScheme !== "folgezettel")
+      return void 0;
+    const { id } = this.splitBasename(basename);
+    return id && isFolgezettelId(id) ? id : void 0;
+  }
   async promoteFleetingToPermanent(file) {
     const content = await this.app.vault.read(file);
-    const titleMatch = file.basename.match(/^\d+ (.+)$/);
-    const title = titleMatch ? titleMatch[1] : file.basename;
+    const { title } = this.splitBasename(file.basename);
+    const keepId = this.promotedId(file.basename);
     const bodyLines = content.split("\n");
     const bodyStart = bodyLines.findIndex((l, i) => i > 0 && l === "---") + 1;
     const noteBody = bodyLines.slice(bodyStart).join("\n").trim();
@@ -373,14 +600,15 @@ _What does this change or open up?_
       title,
       idea: noteBody,
       tags: "permanent",
-      links: `[[${file.basename}]]`
+      links: ""
     };
-    await this.createPermanentNote(data);
+    await this.createPermanentNote(data, keepId);
+    await this.app.fileManager.trashFile(file);
     new import_obsidian.Notice(`Promoted "${title}" to permanent note.`);
   }
   async promoteFleetingToLiterature(file) {
-    const titleMatch = file.basename.match(/^\d+ (.+)$/);
-    const title = titleMatch ? titleMatch[1] : file.basename;
+    const { title } = this.splitBasename(file.basename);
+    const keepId = this.promotedId(file.basename);
     const content = await this.app.vault.read(file);
     const bodyLines = content.split("\n");
     const bodyStart = bodyLines.findIndex((l, i) => i > 0 && l === "---") + 1;
@@ -393,7 +621,8 @@ _What does this change or open up?_
       summary: noteBody,
       quotes: ""
     };
-    await this.createLiteratureNote(data);
+    await this.createLiteratureNote(data, keepId);
+    await this.app.fileManager.trashFile(file);
     new import_obsidian.Notice(`Promoted "${title}" to literature note.`);
   }
   // ─── Inbox View ─────────────────────────────────────────────────────────
@@ -445,12 +674,33 @@ var ZettelkastenSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Zettel ID format").setDesc("Moment.js format for auto-generated IDs. Default: YYYYMMDDHHmm").addText(
-      (t) => t.setPlaceholder("YYYYMMDDHHmm").setValue(this.plugin.settings.idFormat).onChange(async (v) => {
-        this.plugin.settings.idFormat = v;
+    new import_obsidian.Setting(containerEl).setName("ID scheme").setDesc(
+      "Timestamp: date-time IDs (YYYYMMDDHHmm). Folgezettel: Luhmann branching IDs (1, 1a, 1a1\u2026) shared across all note types. Child/sibling commands branch the active note into a fleeting note."
+    ).addDropdown(
+      (d) => d.addOption("timestamp", "Timestamp").addOption("folgezettel", "Folgezettel (branching)").setValue(this.plugin.settings.idScheme).onChange(async (v) => {
+        this.plugin.settings.idScheme = v;
         await this.plugin.saveSettings();
+        this.display();
       })
     );
+    if (this.plugin.settings.idScheme === "timestamp") {
+      new import_obsidian.Setting(containerEl).setName("Zettel ID format").setDesc("Moment.js format for timestamp IDs. Default: YYYYMMDDHHmm").addText(
+        (t) => t.setPlaceholder("YYYYMMDDHHmm").setValue(this.plugin.settings.idFormat).onChange(async (v) => {
+          this.plugin.settings.idFormat = v;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
+    if (this.plugin.settings.idScheme === "folgezettel") {
+      new import_obsidian.Setting(containerEl).setName("Root index note").setDesc(
+        "Optional. New root notes (1, 2, 3\u2026) get a parent link to this note so they aren't orphaned in the graph. Note name or path, e.g. Index or Zettelkasten/Index. Leave empty to disable."
+      ).addText(
+        (t) => t.setPlaceholder("Index").setValue(this.plugin.settings.rootIndexNote).onChange(async (v) => {
+          this.plugin.settings.rootIndexNote = v;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
     new import_obsidian.Setting(containerEl).setName("Auto-open new notes").setDesc("Open the note immediately after creating it.").addToggle(
       (t) => t.setValue(this.plugin.settings.autoOpenNote).onChange(async (v) => {
         this.plugin.settings.autoOpenNote = v;
